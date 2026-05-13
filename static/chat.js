@@ -210,7 +210,11 @@ async function sendMessage(e) {
             body: JSON.stringify(body),
         });
         const data = await res.json();
-        if (data.ok) input.value = "";
+        if (data.ok) {
+            input.value = "";
+        } else if (data.error) {
+            alert(data.error);
+        }
     } finally {
         btn.disabled = false;
         input.focus();

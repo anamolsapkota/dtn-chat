@@ -173,8 +173,10 @@ def api_messages(room):
 
 @app.route("/api/send", methods=["POST"])
 def api_send():
-    """Send a chat message. Store locally in DB + SSE, send DTN bundles to remote nodes.
-    ION does not deliver bundles to the same node (loopback), so local storage is direct."""
+    """Send a chat message via DTN.
+    - Paired users on THIS node: store locally + send bundles to remote nodes
+    - Paired users on REMOTE nodes: reject (they must send bundles from their own node)
+    - Web-only users: store locally + send bundles to remote nodes"""
     user = get_current_user()
     if not user:
         return jsonify({"error": "not logged in"}), 401
@@ -191,6 +193,10 @@ def api_send():
         return jsonify({"error": "message required"}), 400
     if len(message) > 500:
         return jsonify({"error": "message too long (max 500 chars)"}), 400
+
+    # Paired users on REMOTE nodes cannot send via web — only DTN bundles
+    if user["user_type"] == "paired" and user.get("ipn_number") != config.LOCAL_NODE_NUMBER:
+        return jsonify({"error": "Send messages from your DTN node — web sending disabled for paired nodes"}), 403
 
     # For DMs, compute the room ID
     if to_uid:
@@ -237,6 +243,7 @@ def api_send():
         _send_dm_bundle(user, to_uid, payload)
 
     return jsonify({"ok": True})
+
 
 
 def _send_to_paired_users(sender, payload):
