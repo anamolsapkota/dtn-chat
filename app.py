@@ -173,9 +173,8 @@ def api_messages(room):
 
 @app.route("/api/send", methods=["POST"])
 def api_send():
-    """ALL messages flow through DTN bundles.
-    Web UI -> bpchat(.8) -> DTN bundle -> bpchat(.7) -> DB + SSE.
-    Also sends bundles to remote paired IPN nodes."""
+    """Send a chat message. Store locally in DB + SSE, send DTN bundles to remote nodes.
+    ION does not deliver bundles to the same node (loopback), so local storage is direct."""
     user = get_current_user()
     if not user:
         return jsonify({"error": "not logged in"}), 401
@@ -199,7 +198,27 @@ def api_send():
 
     timestamp = datetime.datetime.utcnow().isoformat() + "Z"
 
-    # Build bundle payload
+    # Store locally (ION cannot loopback bundles to the same node)
+    msg_id = database.insert_message(
+        uid=user["uid"],
+        display_name=user["display_name"],
+        room=room,
+        message=message,
+        timestamp=timestamp,
+    )
+
+    # Push to all connected SSE clients
+    full_msg = {
+        "id": msg_id,
+        "uid": user["uid"],
+        "display_name": user["display_name"],
+        "room": room,
+        "message": message,
+        "timestamp": timestamp,
+    }
+    sse_publish_to_room(room, full_msg)
+
+    # Build bundle payload for remote DTN delivery
     payload = {
         "s": config.LOCAL_NODE_NUMBER,
         "n": user["display_name"],
@@ -211,11 +230,7 @@ def api_send():
     if to_uid:
         payload["to_uid"] = to_uid
 
-    # Send via DTN to local receiver (bpchat .8 -> .7 loopback)
-    # The BundleReceiver on .7 will store in DB and push via SSE
-    dtn_transport.send_bundle_to_local(payload)
-
-    # Also send DTN bundles to remote paired IPN nodes
+    # Send DTN bundles to remote paired IPN nodes
     if room == "lobby":
         _send_to_paired_users(user, payload)
     elif to_uid:
@@ -324,23 +339,21 @@ def api_logout():
 
 
 def ensure_endpoint():
-    """Ensure our chat endpoints (.7 and .8) are registered in ION."""
-    for svc in [config.CHAT_SERVICE_NUMBER, 8]:
-        eid = f"ipn:{config.LOCAL_NODE_NUMBER}.{svc}"
-        try:
-            subprocess.run(
-                ["bpadmin"], input=f"a endpoint {eid} q\nq\n",
-                capture_output=True, text=True, timeout=5,
-            )
-        except Exception:
-            pass
+    """Ensure our chat endpoint (.7) is registered in ION."""
+    eid = f"ipn:{config.LOCAL_NODE_NUMBER}.{config.CHAT_SERVICE_NUMBER}"
+    try:
+        subprocess.run(
+            ["bpadmin"], input=f"a endpoint {eid} q\nq\n",
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        pass
 
 
 def main():
     config.detect_node()
     print(f"[dtnchat] Node: ipn:{config.LOCAL_NODE_NUMBER} ({config.LOCAL_NODE_NAME})")
     print(f"[dtnchat] Chat endpoint: ipn:{config.LOCAL_NODE_NUMBER}.{config.CHAT_SERVICE_NUMBER}")
-    print(f"[dtnchat] ALL messages flow through DTN bundles")
 
     database.init_db()
     database.start_cleanup_thread()
@@ -350,10 +363,9 @@ def main():
     global receiver
     receiver = dtn_transport.BundleReceiver(on_message=handle_incoming_bundle)
     receiver.start()
-    print("[dtnchat] Bundle receiver (.7) started")
+    print("[dtnchat] Bundle receiver (.7) started via bprecvfile")
 
     dtn_transport.init_sender()
-    print("[dtnchat] Bundle sender (.8 -> .7) started")
 
     app.run(host=config.FLASK_HOST, port=config.FLASK_PORT, debug=False, threaded=True)
 
