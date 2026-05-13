@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DTN Chat - {{ node_name }}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app">
+        <header>
+            <div class="header-left">
+                <h1>DTN Chat</h1>
+                <span class="node-info">ipn:{{ node_number }}.{{ service_number }}</span>
+                <span class="status-dot" id="statusDot" title="Checking..."></span>
+            </div>
+            <div class="header-right">
+                <span class="user-badge" id="userBadge">
+                    <span class="user-name">{{ user.display_name }}</span>
+                    <span class="user-type">{{ user.user_type }}</span>
+                </span>
+                <button class="logout-btn" id="logoutBtn" title="Leave chat">Leave</button>
+            </div>
+        </header>
+
+        <div class="main">
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <div class="sidebar-header">
+                        <h2>Rooms</h2>
+                    </div>
+                    <div class="room-list">
+                        <div class="room-item active" data-room="lobby" onclick="switchRoom('lobby')">
+                            <span class="room-icon">#</span>
+                            <span class="room-name">Lobby</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="sidebar-section">
+                    <div class="sidebar-header">
+                        <h2>Direct Messages</h2>
+                    </div>
+                    <div class="dm-list" id="dmList"></div>
+                </div>
+
+                <div class="sidebar-section">
+                    <div class="sidebar-header">
+                        <h2>Users</h2>
+                        <button id="refreshNodes" title="Refresh">&#8635;</button>
+                    </div>
+                    <div class="user-list" id="userList">
+                        <div class="loading">Loading...</div>
+                    </div>
+                </div>
+            </aside>
+
+            <main class="chat-area">
+                <div class="room-header" id="roomHeader">
+                    <span class="room-icon">#</span>
+                    <span class="room-title">Lobby</span>
+                </div>
+                <div class="messages" id="messages">
+                    <div class="empty-state">
+                        <h3>Welcome to DTN Chat</h3>
+                        <p>Send messages over the Delay-Tolerant Network</p>
+                        <p>Select a user from the sidebar to start a DM</p>
+                    </div>
+                </div>
+                <form class="compose" id="composeForm">
+                    <input type="text" id="messageInput" placeholder="Type a message..." autocomplete="off" maxlength="500" required>
+                    <button type="submit">Send</button>
+                </form>
+            </main>
+        </div>
+    </div>
+
+    <script>
+        window.CURRENT_USER = {{ user | tojson }};
+    </script>
+    <script src="/static/chat.js"></script>
+</body>
+</html>

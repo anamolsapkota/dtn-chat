@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Join DTN Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="join-page">
+        <div class="join-card">
+            <h1>DTN Chat</h1>
+            <p class="join-subtitle">via ipn:{{ node_number }} &middot; {{ node_name }}</p>
+
+            <div class="detect-status" id="detectStatus">
+                {% if detected_ipn %}
+                <div class="detect-found">
+                    <div class="detect-icon">&#9889;</div>
+                    <div class="detect-info">
+                        <strong>DTN Node Detected</strong>
+                        <span class="detect-detail">ipn:{{ detected_ipn }} &middot; {{ detected_name }}</span>
+                        <span class="detect-ip">from {{ client_ip }}</span>
+                    </div>
+                </div>
+                {% else %}
+                <div class="detect-none">
+                    <div class="detect-icon">&#127760;</div>
+                    <div class="detect-info">
+                        <strong>Web Visitor</strong>
+                        <span class="detect-detail">No DTN node detected at {{ client_ip }}</span>
+                        <span class="detect-ip">Messages via web only (no DTN delivery when offline)</span>
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+
+            <form id="joinForm">
+                <div class="join-field">
+                    <label for="displayName">Display Name</label>
+                    <input type="text" id="displayName" placeholder="Your name" required maxlength="30" autocomplete="off" autofocus>
+                </div>
+
+                <button type="submit" class="join-btn">Join Chat</button>
+                <p class="join-error" id="joinError"></p>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById("joinForm").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const errEl = document.getElementById("joinError");
+            errEl.textContent = "";
+
+            const display_name = document.getElementById("displayName").value.trim();
+            if (!display_name) { errEl.textContent = "Name is required"; return; }
+
+            try {
+                const res = await fetch("/api/join", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ display_name }),
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    window.location.href = "/";
+                } else {
+                    errEl.textContent = data.error || "Failed to join";
+                }
+            } catch (err) {
+                errEl.textContent = "Connection error";
+            }
+        });
+    </script>
+</body>
+</html>
