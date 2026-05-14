@@ -2,7 +2,7 @@
 
 ## Overview
 
-Multi-user web chat over Delay-Tolerant Networking (ION-DTN). Messages between nodes travel exclusively as DTN bundles via the Bundle Protocol. The web UI is for local display and input only — remote paired nodes cannot send via HTTP.
+Pure DTN chat — **all communication via ION bundles, no fallback**. The web UI requires an active ION-DTN node. Non-DTN visitors are blocked. Message delivery is confirmed via DTN acknowledgment bundles.
 
 ## Network Topology
 
@@ -63,18 +63,18 @@ Multi-user web chat over Delay-Tolerant Networking (ION-DTN). Messages between n
 
 ## Message Flows
 
-### Flow 1: Local User Sends to Lobby
+### Flow 1: Sending a Message
 
-User on Pi05 itself (127.0.0.1 or Pi05's own IPs).
+Any paired DTN user sends from the web UI on this node.
 
 ```
-Browser → POST /api/send (HTTP)
+Browser → POST /api/send (HTTP to local Flask)
     │
-    ├─► SQLite: INSERT into messages
-    ├─► SSE: push to all connected browsers
+    ├─► SQLite: INSERT message (status='sent', bundle_id=<uuid>)
+    ├─► SSE: push to local browsers (shows "sent via DTN")
     │
-    └─► For each remote paired user:
-            bpsource ipn:<remote>.7 '{"s":268485091,...}'
+    └─► For each remote paired node:
+            bpsource ipn:<remote>.7 '{"s":268485091,"bid":"<uuid>",...}'
                 │
                 ▼
             ION routes via UDP outduct
@@ -83,54 +83,63 @@ Browser → POST /api/send (HTTP)
             Remote node's udpcli (port 4556)
                 │
                 ▼
-            bprecvfile writes testfileN
+            Remote bprecvfile writes testfileN
                 │
                 ▼
-            Remote BundleReceiver → DB + SSE
+            Remote BundleReceiver:
+                ├─► Dedup check (bundle_id)
+                ├─► Store in DB (status='delivered')
+                ├─► SSE push to remote browsers
+                └─► Send ACK bundle back:
+                        bpsource ipn:<sender>.7 '{"type":"ack","bid":"<uuid>",...}'
 ```
 
-### Flow 2: Web-Only User Sends
+### Flow 2: Receiving an ACK
 
-User with no DTN node (phone, laptop without ION).
+When the ACK bundle arrives back at the sender node:
 
 ```
-Browser → POST /api/send (HTTP)
+ACK bundle arrives at sender's bprecvfile
     │
-    ├─► SQLite: INSERT into messages
-    ├─► SSE: push to all connected browsers
+    ▼
+BundleReceiver detects type="ack"
     │
-    └─► bpsource to each remote paired node
-        (same as Flow 1)
+    ├─► Record in acks table (bundle_id, from_node)
+    ├─► Update messages.ack_count
+    ├─► If ack_count >= dest_count → status = 'delivered'
+    │   Else → status = 'ack:N/M'
+    └─► SSE push status update to sender's browser
+        (UI updates from "sent via DTN" → "1/3 delivered" → "delivered")
 ```
 
-### Flow 3: Remote DTN Node Sends
+### Flow 3: Incoming Bundle from Remote Node
 
-A paired user on a remote node (e.g., echo). **Web UI sending is blocked** — must use DTN.
+A remote node sends a chat message via DTN:
 
 ```
-Remote node runs:
-    bpsource ipn:268485091.7 '{"s":268485111,"n":"echo-user",...}'
-        │
-        ▼
-    ION routes bundle via UDP
-    (ZeroTier 10.16.16.169:4556 or Tailscale 100.75.250.100:4556)
-        │
-        ▼
-    Pi05: udpcli receives on 0.0.0.0:4556
-        │
-        ▼
-    ION delivers to endpoint ipn:268485091.7
-        │
-        ▼
-    bprecvfile writes /tmp/dtn-chat-recv/testfileN
-        │
-        ▼
-    BundleReceiver thread (polls every 0.5s):
-        ├─► Reads file, parses JSON payload
-        ├─► Creates user in DB if unknown
-        ├─► INSERT into messages table
-        ├─► SSE push to all connected browsers
-        └─► Deletes the file
+Remote node: bpsource ipn:268485091.7 '{"s":268485111,...}'
+    │
+    ▼
+ION routes via UDP (Tailscale or ZeroTier)
+    │
+    ▼
+Local udpcli (0.0.0.0:4556) receives
+    │
+    ▼
+ION delivers to endpoint ipn:268485091.7
+    │
+    ▼
+bprecvfile writes /tmp/dtn-chat-recv/testfileN
+    │
+    ▼
+BundleReceiver thread (polls every 0.5s):
+    ├─► Reads file, parses JSON payload
+    ├─► Dedup check by bundle_id (skip if already stored)
+    ├─► Creates sender user in DB if unknown
+    ├─► INSERT into messages (status='delivered')
+    ├─► SSE push to all connected browsers
+    ├─► Send ACK bundle back to sender via DTN
+    └─► Deletes the file
 ```
 
 ### Flow 4: Viewing Messages
@@ -164,6 +173,7 @@ Sender clicks user → switchRoom("dm:<uid1>-<uid2>")
 
 ## Bundle Payload Format
 
+**Chat message:**
 ```json
 {
     "s": 268485091,
@@ -172,7 +182,17 @@ Sender clicks user → switchRoom("dm:<uid1>-<uid2>")
     "m": "message text",
     "room": "lobby",
     "uid": "display-name-268485091",
+    "bid": "a1b2c3d4e5f6",
     "to_uid": "target-uid"
+}
+```
+
+**ACK bundle:**
+```json
+{
+    "type": "ack",
+    "bid": "a1b2c3d4e5f6",
+    "from": 268485111
 }
 ```
 
@@ -184,14 +204,35 @@ Sender clicks user → switchRoom("dm:<uid1>-<uid2>")
 | `m` | Message text (max 500 chars) |
 | `room` | `lobby` or `dm:<uid1>-<uid2>` |
 | `uid` | Sender's user ID |
+| `bid` | Bundle ID for dedup + ACK tracking |
 | `to_uid` | DM recipient (optional) |
+| `type` | `"ack"` for acknowledgment bundles |
+| `from` | ACK sender's IPN node number |
+
+## Message Status Lifecycle
+
+```
+sent → ack:1/3 → ack:2/3 → delivered
+  │                              │
+  └──► failed (if bpsource fails for all destinations)
+```
+
+| Status | Meaning |
+|--------|---------|
+| `sent` | Bundle handed to ION for delivery |
+| `ack:N/M` | N of M destination nodes confirmed receipt |
+| `delivered` | All destination nodes confirmed receipt |
+| `failed` | bpsource failed for all destinations |
+| `local` | No remote nodes to send to |
 
 ## Data Storage
 
 ```
 SQLite: chat.db
-├── messages (id, uid, display_name, room, message, timestamp, created_at)
+├── messages (id, uid, display_name, room, message, timestamp,
+│             bundle_id, status, dest_count, ack_count, created_at)
 ├── users (uid, display_name, ipn_number, user_type, last_seen, created_at)
+├── acks (id, bundle_id, from_node, received_at)
 └── nodes (node_number, node_name, description, source, updated_at)
 ```
 
@@ -199,14 +240,16 @@ SQLite: chat.db
 - Max 1000 messages retained
 - Cookie-based sessions (`dtn_uid`, 30-day expiry)
 - No passwords — display name only
+- All users must be DTN-paired (no web-only users)
 
 ## User Types
 
-| Type | Detection | Can Send via Web | Messages via |
-|------|-----------|-----------------|-------------|
-| `paired` (local) | IP matches this node | Yes | DB + bpsource to remotes |
-| `paired` (remote) | IP matches a remote IPN plan | **No** (403) | DTN bundles only |
-| `nickname` (web) | IP not in any IPN plan | Yes | DB + bpsource to remotes |
+| Type | Detection | Access |
+|------|-----------|--------|
+| `paired` | IP matches a known IPN node | Full chat via DTN |
+| Non-DTN visitor | IP not in any IPN plan | **Blocked** — cannot join |
+
+There are no web-only users. All participants must have an active ION-DTN node.
 
 ## Auto-Detection (IP → IPN)
 
