@@ -17,18 +17,28 @@ import config
 
 
 def send_bundle_to_remote(dest_node, payload):
-    """Send a bundle to a remote node via bpsource."""
+    """Send a bundle to a remote node via bpsource. Returns True on success."""
     payload_str = json.dumps(payload)
     dest_eid = f"ipn:{dest_node}.{config.CHAT_SERVICE_NUMBER}"
     try:
-        subprocess.run(
+        proc = subprocess.run(
             ["bpsource", dest_eid, payload_str],
             timeout=10,
             capture_output=True,
+            text=True,
         )
-        print(f"[dtn] sent bundle to {dest_eid}")
+        if proc.returncode == 0:
+            print(f"[dtn] sent bundle to {dest_eid}")
+            return True
+        else:
+            print(f"[dtn] bpsource error for {dest_eid}: {proc.stderr.strip()}")
+            return False
     except subprocess.TimeoutExpired:
         print(f"[dtn] timeout sending to {dest_eid}")
+        return False
+    except Exception as e:
+        print(f"[dtn] send error for {dest_eid}: {e}")
+        return False
 
 
 class BundleReceiver(threading.Thread):

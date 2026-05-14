@@ -161,6 +161,30 @@ body {
     min-height: 18px;
 }
 
+.join-blocked {
+    padding: 16px;
+    background: #2d1b1b;
+    border: 1px solid #f85149;
+    border-radius: 8px;
+    text-align: left;
+    font-size: 13px;
+    color: #f0a0a0;
+    line-height: 1.6;
+}
+
+/* --- Message Status --- */
+
+.msg-status {
+    font-size: 10px;
+    margin-top: 2px;
+    opacity: 0.7;
+}
+
+.msg-status.sent { color: #8b949e; }
+.msg-status.delivered { color: #3fb950; }
+.msg-status.failed { color: #f85149; }
+.msg-status.local { color: #d29922; }
+
 /* --- App Layout --- */
 
 .app {

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""DTN Chat - Multi-user web chat over Delay-Tolerant Networking."""
+"""DTN Chat - Pure DTN messaging. All communication via ION bundles."""
 
 import json
 import queue
 import subprocess
 import datetime
 import threading
+import uuid
 
 from flask import Flask, render_template, jsonify, request, redirect, make_response
 
@@ -40,6 +41,18 @@ def sse_publish_to_room(room, msg_dict):
     sse_publish(room, event_data)
 
 
+def sse_publish_status(msg_id, status):
+    """Notify clients about message delivery status change."""
+    event_data = f"event: status\ndata: {json.dumps({'id': msg_id, 'status': status})}\n\n"
+    with _sse_lock:
+        for uid, clients in list(_sse_clients.items()):
+            for q in clients:
+                try:
+                    q.put_nowait(event_data)
+                except queue.Full:
+                    pass
+
+
 def sse_publish_user_update():
     """Notify all clients that the user list changed."""
     event_data = f"event: users\ndata: updated\n\n"
@@ -70,6 +83,11 @@ def index():
     user = get_current_user()
     if not user:
         return redirect("/join")
+    # Verify user is still a DTN-paired node
+    if user["user_type"] != "paired":
+        resp = make_response(redirect("/join"))
+        resp.delete_cookie("dtn_uid")
+        return resp
     return render_template(
         "index.html",
         user=user,
@@ -120,16 +138,12 @@ def api_join():
     client_ip = request.remote_addr
     detected_ipn, _ = peer_discovery.resolve_ipn_from_ip(client_ip)
 
-    if detected_ipn:
-        # Visitor is from a known DTN node — auto-pair
-        user_type = "paired"
-        ipn_number = detected_ipn
-        uid = f"{display_name.lower()}-{ipn_number}"
-    else:
-        # Unknown IP — nickname user (web-only)
-        user_type = "nickname"
-        ipn_number = None
-        uid = f"{display_name.lower()}-web"
+    if not detected_ipn:
+        return jsonify({"error": "No DTN node detected. You must connect from a device running ION-DTN."}), 403
+
+    user_type = "paired"
+    ipn_number = detected_ipn
+    uid = f"{display_name.lower()}-{ipn_number}"
 
     database.upsert_user(uid, display_name, ipn_number, user_type)
     sse_publish_user_update()
@@ -161,7 +175,6 @@ def api_users():
 @app.route("/api/messages/<room>")
 def api_messages(room):
     after_id = request.args.get("after_id", 0, type=int)
-    # Validate room access for DMs
     user = get_current_user()
     if not user:
         return jsonify({"error": "not logged in"}), 401
@@ -173,13 +186,17 @@ def api_messages(room):
 
 @app.route("/api/send", methods=["POST"])
 def api_send():
-    """Send a chat message via DTN.
-    - Paired users on THIS node: store locally + send bundles to remote nodes
-    - Paired users on REMOTE nodes: reject (they must send bundles from their own node)
-    - Web-only users: store locally + send bundles to remote nodes"""
+    """Send a chat message — ALL messages go through DTN bundles.
+    1. Store locally with status='sent' (ION can't loopback)
+    2. Send DTN bundle to every other known node
+    3. Remote nodes send ACK bundles back → status='delivered'
+    """
     user = get_current_user()
     if not user:
         return jsonify({"error": "not logged in"}), 401
+
+    if user["user_type"] != "paired":
+        return jsonify({"error": "DTN node required"}), 403
 
     data = request.get_json()
     if not data:
@@ -194,26 +211,37 @@ def api_send():
     if len(message) > 500:
         return jsonify({"error": "message too long (max 500 chars)"}), 400
 
-    # Paired users on REMOTE nodes cannot send via web — only DTN bundles
-    if user["user_type"] == "paired" and user.get("ipn_number") != config.LOCAL_NODE_NUMBER:
-        return jsonify({"error": "Send messages from your DTN node — web sending disabled for paired nodes"}), 403
-
     # For DMs, compute the room ID
     if to_uid:
         room = database.get_dm_room_id(user["uid"], to_uid)
 
     timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+    bundle_id = uuid.uuid4().hex[:12]
 
-    # Store locally (ION cannot loopback bundles to the same node)
+    # Collect destination nodes for this message
+    dest_nodes = set()
+    if room == "lobby":
+        for u in database.get_all_users():
+            if u["user_type"] == "paired" and u["ipn_number"] and u["ipn_number"] != user.get("ipn_number"):
+                dest_nodes.add(u["ipn_number"])
+    elif to_uid:
+        recipient = database.get_user(to_uid)
+        if recipient and recipient["user_type"] == "paired" and recipient["ipn_number"]:
+            dest_nodes.add(recipient["ipn_number"])
+
+    # Store locally with status='sent' (ION can't loopback to same node)
     msg_id = database.insert_message(
         uid=user["uid"],
         display_name=user["display_name"],
         room=room,
         message=message,
         timestamp=timestamp,
+        bundle_id=bundle_id,
+        status="sent",
+        dest_count=len(dest_nodes),
     )
 
-    # Push to all connected SSE clients
+    # Push to local SSE clients
     full_msg = {
         "id": msg_id,
         "uid": user["uid"],
@@ -221,44 +249,40 @@ def api_send():
         "room": room,
         "message": message,
         "timestamp": timestamp,
+        "status": "sent",
+        "bundle_id": bundle_id,
     }
     sse_publish_to_room(room, full_msg)
 
-    # Build bundle payload for remote DTN delivery
+    # Build bundle payload
     payload = {
-        "s": config.LOCAL_NODE_NUMBER,
+        "s": user.get("ipn_number", config.LOCAL_NODE_NUMBER),
         "n": user["display_name"],
         "t": timestamp,
         "m": message,
         "room": room,
         "uid": user["uid"],
+        "bid": bundle_id,
     }
     if to_uid:
         payload["to_uid"] = to_uid
 
-    # Send DTN bundles to remote paired IPN nodes
-    if room == "lobby":
-        _send_to_paired_users(user, payload)
-    elif to_uid:
-        _send_dm_bundle(user, to_uid, payload)
+    # Send DTN bundles to all destination nodes
+    sent_count = 0
+    for dest_node in dest_nodes:
+        ok = dtn_transport.send_bundle_to_remote(dest_node=dest_node, payload=payload)
+        if ok:
+            sent_count += 1
 
-    return jsonify({"ok": True})
+    if not dest_nodes:
+        # No remote nodes to send to — message is local only
+        database.update_message_status(msg_id, "local")
+        sse_publish_status(msg_id, "local")
+    elif sent_count == 0:
+        database.update_message_status(msg_id, "failed")
+        sse_publish_status(msg_id, "failed")
 
-
-
-def _send_to_paired_users(sender, payload):
-    """Send lobby message as DTN bundle to all paired IPN users."""
-    users = database.get_all_users()
-    for u in users:
-        if u["user_type"] == "paired" and u["uid"] != sender["uid"] and u["ipn_number"]:
-            dtn_transport.send_bundle_to_remote(dest_node=u["ipn_number"], payload=payload)
-
-
-def _send_dm_bundle(sender, to_uid, payload):
-    """Send DM as DTN bundle to recipient if they have a paired IPN node."""
-    recipient = database.get_user(to_uid)
-    if recipient and recipient["user_type"] == "paired" and recipient["ipn_number"]:
-        dtn_transport.send_bundle_to_remote(dest_node=recipient["ipn_number"], payload=payload)
+    return jsonify({"ok": True, "msg_id": msg_id, "bundle_id": bundle_id, "sent_to": sent_count})
 
 
 @app.route("/api/nodes")
@@ -378,27 +402,38 @@ def main():
 
 
 def handle_incoming_bundle(msg_dict):
-    """Called by BundleReceiver when a chat bundle arrives."""
+    """Called by BundleReceiver when a chat bundle arrives via DTN."""
+    msg_type = msg_dict.get("type", "msg")
+
+    if msg_type == "ack":
+        _handle_ack(msg_dict)
+        return
+
     uid = msg_dict.get("uid", f"unknown-{msg_dict.get('s', 0)}")
     display_name = msg_dict.get("n", "Unknown")
     room = msg_dict.get("room", "lobby")
     to_uid = msg_dict.get("to_uid")
     message = msg_dict.get("m", "")
+    bundle_id = msg_dict.get("bid", "")
     timestamp = msg_dict.get("t", datetime.datetime.utcnow().isoformat() + "Z")
 
     if not message:
+        return
+
+    # Deduplicate by bundle_id
+    if bundle_id and database.message_exists_by_bundle_id(bundle_id):
+        print(f"[receiver] duplicate bundle {bundle_id}, skipping")
         return
 
     # For DMs, compute proper room ID
     if room == "dm" and to_uid:
         room = database.get_dm_room_id(uid, to_uid)
 
-    # Ensure user exists
+    # Ensure sender user exists
     sender_node = msg_dict.get("s")
     if sender_node:
-        user_type = "paired"
         if not database.get_user(uid):
-            database.upsert_user(uid, display_name, sender_node, user_type)
+            database.upsert_user(uid, display_name, sender_node, "paired")
         database.upsert_node(sender_node, display_name, source="chat")
 
     msg_id = database.insert_message(
@@ -407,6 +442,8 @@ def handle_incoming_bundle(msg_dict):
         room=room,
         message=message,
         timestamp=timestamp,
+        bundle_id=bundle_id,
+        status="delivered",
     )
 
     full_msg = {
@@ -416,8 +453,36 @@ def handle_incoming_bundle(msg_dict):
         "room": room,
         "message": message,
         "timestamp": timestamp,
+        "status": "delivered",
+        "bundle_id": bundle_id,
     }
     sse_publish_to_room(room, full_msg)
+
+    # Send ACK back to sender via DTN
+    if sender_node and sender_node != config.LOCAL_NODE_NUMBER and bundle_id:
+        ack_payload = {
+            "type": "ack",
+            "bid": bundle_id,
+            "from": config.LOCAL_NODE_NUMBER,
+        }
+        dtn_transport.send_bundle_to_remote(dest_node=sender_node, payload=ack_payload)
+        print(f"[ack] sent ack for {bundle_id} to ipn:{sender_node}")
+
+
+def _handle_ack(msg_dict):
+    """Process a delivery acknowledgment bundle."""
+    bundle_id = msg_dict.get("bid")
+    from_node = msg_dict.get("from")
+    if not bundle_id:
+        return
+
+    ack_count = database.record_ack(bundle_id, from_node)
+    msg = database.get_message_by_bundle_id(bundle_id)
+    if msg:
+        new_status = "delivered" if ack_count >= msg.get("dest_count", 1) else f"ack:{ack_count}/{msg.get('dest_count', '?')}"
+        database.update_message_status(msg["id"], new_status)
+        sse_publish_status(msg["id"], new_status)
+        print(f"[ack] bundle {bundle_id} ack from ipn:{from_node} ({new_status})")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-/* DTN Chat - SSE client with rooms and DMs */
+/* DTN Chat - Pure DTN messaging client */
 
 const ME = window.CURRENT_USER;
 let currentRoom = "lobby";
@@ -22,12 +22,18 @@ function connectSSE() {
             if (msg.room === currentRoom) {
                 appendMessage(msg);
             }
-            // Show notification dot for DMs not in current room
             if (msg.room !== currentRoom && msg.room.startsWith("dm:") && msg.room.includes(ME.uid)) {
                 markDmUnread(msg.room);
             }
         } catch {}
     };
+
+    evtSource.addEventListener("status", (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            updateMessageStatus(data.id, data.status);
+        } catch {}
+    });
 
     evtSource.addEventListener("users", () => {
         loadUsers();
@@ -48,7 +54,6 @@ function switchRoom(room, label) {
     lastMsgId = 0;
     document.getElementById("messages").innerHTML = "";
 
-    // Update room header
     const header = document.getElementById("roomHeader");
     if (room === "lobby") {
         header.innerHTML = '<span class="room-icon">#</span><span class="room-title">Lobby</span>';
@@ -56,7 +61,6 @@ function switchRoom(room, label) {
         header.innerHTML = `<span class="room-icon">@</span><span class="room-title">${esc(label || room)}</span>`;
     }
 
-    // Update active states
     document.querySelectorAll(".room-item, .dm-item").forEach(el => el.classList.remove("active"));
     const activeEl = document.querySelector(`[data-room="${CSS.escape(room)}"]`);
     if (activeEl) {
@@ -95,11 +99,9 @@ function markDmUnread(room) {
     const el = document.querySelector(`[data-room="${CSS.escape(room)}"]`);
     if (el) el.classList.add("unread");
     else {
-        // Extract other user's uid from room id
         const parts = room.replace("dm:", "").split("-");
-        // Find which part is not me
         let otherUid = parts.filter(p => !ME.uid.startsWith(p)).join("-");
-        if (!otherUid) otherUid = parts[1]; // fallback
+        if (!otherUid) otherUid = parts[1];
         const other = users.find(u => u.uid.includes(otherUid));
         addDmTab(room, other ? other.display_name : otherUid);
         const newEl = document.querySelector(`[data-room="${CSS.escape(room)}"]`);
@@ -144,11 +146,29 @@ function appendMessageEl(container, m) {
     const div = document.createElement("div");
     const isMine = m.uid === ME.uid;
     div.className = `msg ${isMine ? "sent" : "received"}`;
+    div.dataset.msgId = m.id;
     const time = formatTime(m.timestamp);
     const sender = isMine ? "You" : m.display_name;
-    const typeTag = "";
-    div.innerHTML = `<div class="meta">${esc(sender)} &middot; ${time}</div><div class="text">${esc(m.message)}</div>`;
+    const statusHtml = isMine ? `<div class="msg-status ${m.status || 'sent'}" data-status-id="${m.id}">${statusLabel(m.status)}</div>` : '';
+    div.innerHTML = `<div class="meta">${esc(sender)} &middot; ${time}</div><div class="text">${esc(m.message)}</div>${statusHtml}`;
     container.appendChild(div);
+}
+
+function statusLabel(status) {
+    if (!status || status === "sent") return "sent via DTN";
+    if (status === "delivered") return "delivered";
+    if (status === "failed") return "send failed";
+    if (status === "local") return "local (no remote nodes)";
+    if (status.startsWith("ack:")) return status.replace("ack:", "") + " delivered";
+    return status;
+}
+
+function updateMessageStatus(msgId, status) {
+    const el = document.querySelector(`[data-status-id="${msgId}"]`);
+    if (el) {
+        el.textContent = statusLabel(status);
+        el.className = `msg-status ${status.startsWith("ack:") ? "delivered" : status}`;
+    }
 }
 
 // --- Users ---
@@ -174,7 +194,7 @@ function renderUsers() {
                 ${u.uid === ME.uid ? '<span class="you-tag">you</span>' : ''}
             </div>
             <div class="user-item-detail">
-                ${u.user_type === 'paired' ? `<span class="paired-badge">ipn:${u.ipn_number}</span>` : '<span class="web-badge">web</span>'}
+                <span class="paired-badge">ipn:${u.ipn_number}</span>
             </div>
         </div>
     `).join("");
@@ -193,9 +213,6 @@ async function sendMessage(e) {
 
     const body = { message: msg, room: currentRoom };
     if (currentRoom.startsWith("dm:")) {
-        // Extract the other uid from room
-        const parts = currentRoom.replace("dm:", "").split("-");
-        // Find uid that isn't me - need to handle compound uids
         const myIdx = currentRoom.indexOf(ME.uid);
         if (myIdx >= 0) {
             const roomContent = currentRoom.replace("dm:", "");

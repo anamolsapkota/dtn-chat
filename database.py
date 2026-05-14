@@ -30,11 +30,24 @@ def init_db():
             room TEXT NOT NULL,
             message TEXT NOT NULL,
             timestamp TEXT NOT NULL,
+            bundle_id TEXT,
+            status TEXT DEFAULT 'sent',
+            dest_count INTEGER DEFAULT 0,
+            ack_count INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now'))
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room, id);
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_bundle_id ON messages(bundle_id);
+
+        CREATE TABLE IF NOT EXISTS acks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bundle_id TEXT NOT NULL,
+            from_node INTEGER NOT NULL,
+            received_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(bundle_id, from_node)
+        );
 
         -- Keep old nodes table for peer discovery
         CREATE TABLE IF NOT EXISTS nodes (
@@ -45,6 +58,24 @@ def init_db():
             source TEXT
         );
     """)
+    # Migrate: add new columns if they don't exist
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN bundle_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN status TEXT DEFAULT 'sent'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN dest_count INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN ack_count INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
     conn.close()
 
 
@@ -100,18 +131,70 @@ def get_all_users():
 
 # --- Message operations ---
 
-def insert_message(uid, display_name, room, message, timestamp):
+def insert_message(uid, display_name, room, message, timestamp,
+                    bundle_id=None, status="sent", dest_count=0):
     with _lock:
         conn = _get_conn()
         cur = conn.execute(
-            "INSERT INTO messages (uid, display_name, room, message, timestamp) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (uid, display_name, room, message, timestamp),
+            "INSERT INTO messages (uid, display_name, room, message, timestamp, "
+            "bundle_id, status, dest_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (uid, display_name, room, message, timestamp, bundle_id, status, dest_count),
         )
         msg_id = cur.lastrowid
         conn.commit()
         conn.close()
         return msg_id
+
+
+def update_message_status(msg_id, status):
+    with _lock:
+        conn = _get_conn()
+        conn.execute("UPDATE messages SET status = ? WHERE id = ?", (status, msg_id))
+        conn.commit()
+        conn.close()
+
+
+def message_exists_by_bundle_id(bundle_id):
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id FROM messages WHERE bundle_id = ? LIMIT 1", (bundle_id,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_message_by_bundle_id(bundle_id):
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM messages WHERE bundle_id = ? LIMIT 1", (bundle_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def record_ack(bundle_id, from_node):
+    """Record an ACK and return total ack count for this bundle."""
+    with _lock:
+        conn = _get_conn()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO acks (bundle_id, from_node) VALUES (?, ?)",
+                (bundle_id, from_node),
+            )
+        except Exception:
+            pass
+        conn.execute(
+            "UPDATE messages SET ack_count = "
+            "(SELECT COUNT(*) FROM acks WHERE acks.bundle_id = messages.bundle_id) "
+            "WHERE bundle_id = ?",
+            (bundle_id,),
+        )
+        row = conn.execute(
+            "SELECT ack_count FROM messages WHERE bundle_id = ? LIMIT 1", (bundle_id,)
+        ).fetchone()
+        conn.commit()
+        conn.close()
+        return row[0] if row else 0
 
 
 def get_messages(room, limit=200, after_id=0):

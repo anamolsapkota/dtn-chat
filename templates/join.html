@@ -24,28 +24,36 @@
                 </div>
                 {% else %}
                 <div class="detect-none">
-                    <div class="detect-icon">&#127760;</div>
+                    <div class="detect-icon">&#128683;</div>
                     <div class="detect-info">
-                        <strong>Web Visitor</strong>
-                        <span class="detect-detail">No DTN node detected at {{ client_ip }}</span>
-                        <span class="detect-ip">Messages via web only (no DTN delivery when offline)</span>
+                        <strong>No DTN Node Detected</strong>
+                        <span class="detect-detail">Your device must be running ION-DTN to use this chat</span>
+                        <span class="detect-ip">{{ client_ip }} is not a known DTN node</span>
                     </div>
                 </div>
                 {% endif %}
             </div>
 
+            {% if detected_ipn %}
             <form id="joinForm">
                 <div class="join-field">
                     <label for="displayName">Display Name</label>
                     <input type="text" id="displayName" placeholder="Your name" required maxlength="30" autocomplete="off" autofocus>
                 </div>
 
-                <button type="submit" class="join-btn">Join Chat</button>
+                <button type="submit" class="join-btn">Join Chat via DTN</button>
                 <p class="join-error" id="joinError"></p>
             </form>
+            {% else %}
+            <div class="join-blocked">
+                <p>DTN-only chat requires an active ION-DTN node.</p>
+                <p>Ensure ION is running and your node has a route to this server.</p>
+            </div>
+            {% endif %}
         </div>
     </div>
 
+    {% if detected_ipn %}
     <script>
         document.getElementById("joinForm").addEventListener("submit", async (e) => {
             e.preventDefault();
@@ -72,5 +80,6 @@
             }
         });
     </script>
+    {% endif %}
 </body>
 </html>
